@@ -1,0 +1,7 @@
+his_video.mp4
+demo_out.mp4
+vtest.avi
+frame_*.png
+obj/
+__pycache__/
+*.pt
