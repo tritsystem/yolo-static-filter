@@ -5,3 +5,4 @@ frame_*.png
 obj/
 __pycache__/
 *.pt
+clip_out.mp4

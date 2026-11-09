@@ -9,6 +9,23 @@ Suppresses **permanently-static false-positive boxes** in Ultralytics YOLO video
 e.g. a bolted steel frame or a block repeatedly flagged as a "worker" on a construction
 site — while keeping real people who move then pause.
 
+## Real-footage check (OpenCV `vtest.avi`, yolo11n + CLIP stage)
+
+![CLIP stage on vtest.avi](clip_demo.gif)
+
+*Cyan = a still person the gate examined and kept because CLIP saw a person; orange = kept by the
+confidence/liveness fallback; green = moving people. Raw, un-injected footage.*
+
+- 795 frames, 4,256 person detections, 48 tracks. People who stood still long enough to become
+  static suspects were all **kept**; **0 real people removed**.
+- **Honest scope:** this clip contains no real static false positives, so it shows the gate does not
+  over-remove; it does not show it catching a real one (that needs raw worksite footage).
+- **Bug found by this check, and fixed:** an earlier version let a CLIP "structure" verdict remove a
+  detection on its own. On this clip CLIP misread a still person half-hidden behind a pole and sign
+  as "structure" and the gate dropped them for 7 frames. Now CLIP can *keep* a detection but never
+  *remove* one alone — removal always also requires the detection to be pixel-frozen (a living
+  person is not). Locked in by a regression test that fails on the old rule and passes on the new one.
+
 ## The idea (why it works, and its limits)
 A worker standing still has no motion *right now* — so you can't filter on current motion
 alone or you'd delete real people. The real signal is **"this detection has never

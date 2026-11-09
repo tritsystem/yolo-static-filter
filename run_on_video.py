@@ -46,6 +46,7 @@ def main():
     writer = None
     total_suppressed = 0
     frames = 0
+    still_frames = []
     stream = model.track(source=src, stream=True, persist=True,
                          classes=args.classes, conf=args.conf, verbose=False)
     for result in stream:
@@ -62,7 +63,16 @@ def main():
                    if boxes.id is not None else [None] * len(xyxy))
             for b, keep_it, tid in zip(xyxy, keep, ids):
                 x1, y1, x2, y2 = map(int, b)
-                if keep_it:
+                checked = filt._appear.get(int(tid)) if tid is not None else None
+                if keep_it and checked is not None:
+                    # a still person the gate examined and kept: show which stage kept it
+                    why = "CLIP: person" if checked[1] == "person" else "conf/liveness"
+                    col = (255, 255, 0) if checked[1] == "person" else (0, 215, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+                    cv2.putText(frame, f"still, kept ({why})", (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+                    still_frames.append(frames)
+                elif keep_it:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
                     cv2.putText(frame, f"id{tid}" if tid is not None else "keep",
                                 (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
@@ -93,6 +103,8 @@ def main():
     if args.view:
         cv2.destroyAllWindows()
     print(f"frames={frames}  total detections suppressed as static={total_suppressed}")
+    if still_frames:
+        print(f"still-but-kept boxes shown on {len(still_frames)} frame-detections, frames {min(still_frames)}-{max(still_frames)}")
     if args.save:
         print(f"wrote {args.save}")
 

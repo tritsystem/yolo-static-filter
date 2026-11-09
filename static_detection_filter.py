@@ -226,11 +226,12 @@ class StaticDetectionFilter:
                 if app == "person":
                     return True                           # looks like a person -> keep (even a
                                                           # worker stationary since camera start)
-                if app == "structure":
-                    self._mark_zone(xyxy)
-                    return False                          # confirmed a structure -> drop (even if
-                                                          # YOLO was confident)
-                if self._is_false_positive(tid, xyxy):    # no verifier / unsure -> conf+liveness
+                # CLIP can veto a removal but never remove on its own: an occluded still person
+                # can look like "pole + sign" to CLIP. Dropping always requires pixel-frozen
+                # (a living person is not), plus low confidence or a CLIP "structure" verdict.
+                frozen = not self._alive(tid, xyxy)
+                low_conf = self._maxconf.get(tid, 0.0) < self.conf_keep
+                if frozen and (low_conf or app == "structure"):
                     self._mark_zone(xyxy)
                     return False
             return True                                   # doubt / valid static -> keep
@@ -324,20 +325,28 @@ def selftest_appearance():
                               verifier=_MockVerifier(), verify_every=5)
     rng = np.random.default_rng(2)
     bg = rng.integers(0, 60, (H, W, 3), dtype=np.uint8)
-    kp, ks = [], []
+    # regression (found on vtest.avi): an OCCLUDED still person whose crop CLIP reads as
+    # "structure" (pole + sign) but who is alive -> must be KEPT; CLIP alone may never remove.
+    OCCL = (140, 60, 200, 170)
+    kp, ks, ko = [], [], []
     for i in range(70):
         frame = bg.copy()
         cv2.rectangle(frame, PERSON[:2], PERSON[2:], (210, 210, 210), -1)   # bright -> "person"
         cv2.rectangle(frame, STRUCT[:2], STRUCT[2:], (120, 120, 120), -1)   # mid   -> "structure"
+        occ = np.full((OCCL[3] - OCCL[1], OCCL[2] - OCCL[0], 3), 120, np.int16)
+        occ = np.clip(occ + rng.integers(-18, 19, occ.shape), 0, 255).astype(np.uint8)
+        frame[OCCL[1]:OCCL[3], OCCL[0]:OCCL[2]] = occ                        # "structure" but alive
         f.update(frame)
         p = f.keep(PERSON, 1, conf=0.30)      # low conf, never moves, frozen
         s = f.keep(STRUCT, 2, conf=0.30)
+        o = f.keep(OCCL, 3, conf=0.30)
         if i > 30:
-            kp.append(p); ks.append(s)
-    pr, sr = float(np.mean(kp)), float(np.mean(ks))
+            kp.append(p); ks.append(s); ko.append(o)
+    pr, sr, orr = float(np.mean(kp)), float(np.mean(ks)), float(np.mean(ko))
     print(f"[appearance] cold-start PERSON kept  = {pr:.2f}  (want ~1.00 KEEP via 'person')")
     print(f"[appearance] STRUCTURE kept          = {sr:.2f}  (want ~0.00 drop via 'structure')")
-    ok = pr > 0.9 and sr < 0.1
+    print(f"[appearance] OCCLUDED alive kept     = {orr:.2f}  (want ~1.00 KEEP: CLIP can't remove alone)")
+    ok = pr > 0.9 and sr < 0.1 and orr > 0.9
     print("[appearance]", "PASS" if ok else "FAIL",
           "- appearance keeps a worker stationary since camera start; drops the structure")
     return ok
