@@ -21,7 +21,7 @@ class ClipAppearanceVerifier:
     STRUCTURE = ["metal scaffolding", "a steel beam", "construction equipment", "a concrete wall",
                  "an empty background", "a pile of building materials", "a crane or girder"]
 
-    def __init__(self, model_name="ViT-B-32", pretrained="openai", device=None, margin=0.15):
+    def __init__(self, model_name="ViT-B-32-quickgelu", pretrained="openai", device=None, margin=0.15):
         import torch
         import open_clip
         self.torch = torch
