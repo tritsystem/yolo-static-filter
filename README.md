@@ -22,6 +22,15 @@ moved."** A fixed structure is static forever; a worker walked into frame at som
   static structure's box — a real failure mode found and fixed during testing on vtest.avi.
 - **Spatial fallback** (no tracking): a box over a region with no foreground motion for
   more than `static_patience` frames is suppressed (MOG2 background subtractor).
+- **Positive false-positive evidence required (keeps valid static objects):** a pinned detection
+  is dropped only with evidence it's actually a false positive — it must be **low-confidence AND
+  pixel-frozen** (temporal per-pixel variance near the noise floor). A confidently-detected or
+  micro-moving (living) object is kept, so a worker who pauses is not removed.
+- **Optional CLIP appearance verifier (`clip_verifier.py`, pattern-based & motion-independent):**
+  the authoritative check for static detections. It keeps anything CLIP sees as a **person**
+  (including a worker stationary *since the camera turned on* — identity by appearance, no motion
+  history needed) and drops anything CLIP sees as a **structure** (even if YOLO was confident).
+  Runs only on suspicious pinned detections, cached per track. Enable with `--clip`.
 - **Whole-picture vibration is acknowledged**: a phase-correlation detector measures the
   global frame-to-frame shift; when the camera shakes (high-confidence global shift, or a
   huge share of the frame changing), `filter.vibrating` goes True, suppression is paused and

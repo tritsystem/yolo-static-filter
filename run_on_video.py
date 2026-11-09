@@ -28,12 +28,20 @@ def main():
     ap.add_argument("--static-patience", type=int, default=60)
     ap.add_argument("--motion-thresh", type=float, default=0.02)
     ap.add_argument("--warmup", type=int, default=30)
+    ap.add_argument("--clip", action="store_true",
+                    help="add the CLIP appearance verifier (keeps even a worker stationary since "
+                         "camera start; drops confidently-misdetected structures)")
     args = ap.parse_args()
 
     src = 0 if args.source == "0" else args.source
     model = YOLO(args.model)
+    verifier = None
+    if args.clip:
+        from clip_verifier import ClipAppearanceVerifier
+        verifier = ClipAppearanceVerifier()
     filt = StaticDetectionFilter(motion_thresh=args.motion_thresh,
-                                 static_patience=args.static_patience, warmup=args.warmup)
+                                 static_patience=args.static_patience, warmup=args.warmup,
+                                 verifier=verifier)
 
     writer = None
     total_suppressed = 0

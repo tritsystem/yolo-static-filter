@@ -40,7 +40,8 @@ class StaticDetectionFilter:
                  move_eps_px=10.0, move_eps_frac=0.25, zone_hits=8, zone_cover=0.6,
                  motion_thresh=0.02, history=500, var_threshold=16, global_motion_cap=0.5,
                  vib_shift_px=1.5, vib_response=0.15,
-                 conf_keep=0.55, live_thresh=3.0, live_window=16):
+                 conf_keep=0.55, live_thresh=3.0, live_window=16,
+                 verifier=None, verify_every=15):
         """
         confirm_frames   frames a track may stay pinned before it is judged static/suppressed
         warmup           frames to observe before the gate starts suppressing
@@ -70,6 +71,10 @@ class StaticDetectionFilter:
         self.conf_keep = float(conf_keep)        # max conf at/above which a pinned det is kept
         self.live_thresh = float(live_thresh)    # temporal per-pixel std above which = "alive"
         self.live_window = int(live_window)
+        # optional appearance verifier (e.g. ClipAppearanceVerifier): the pattern-based,
+        # motion-independent check. .verify(crop_bgr) -> ("person"|"structure"|"unsure", margin)
+        self.verifier = verifier
+        self.verify_every = int(verify_every)
         self._bg = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=var_threshold, detectShadows=False)
         self._frame = 0
@@ -83,8 +88,10 @@ class StaticDetectionFilter:
         self._shift = 0.0                   # last global frame-to-frame shift magnitude (px)
         self.vibrating = False              # True when the whole picture is shaking
         self._gray = None                   # current grayscale frame (for liveness crops)
+        self._bgr = None                    # current colour frame (for appearance crops)
         self._maxconf = {}                  # id -> max detection confidence ever seen
         self._live = {}                     # id -> recent downscaled gray crops (liveness)
+        self._appear = {}                   # id -> (frame_checked, verdict) appearance cache
 
     # ---- per-frame update (call once, before keep/gate) --------------------------------
     def update(self, frame_bgr, learning_rate=-1):
@@ -114,6 +121,7 @@ class StaticDetectionFilter:
             self._last_motion[fg] = self._frame     # don't trust motion while shaking
         self._fg = fg
         self._gray = gray
+        self._bgr = frame_bgr
         self._frame += 1
         return mask
 
@@ -164,6 +172,23 @@ class StaticDetectionFilter:
         frozen = not self._alive(tid, xyxy)
         return low_conf and frozen
 
+    def _appearance(self, tid, xyxy):
+        """Pattern-based, motion-independent verdict from the plugged-in verifier (CLIP), cached
+        per track and refreshed every verify_every frames. Returns 'person' | 'structure' | None."""
+        if self.verifier is None or self._bgr is None:
+            return None
+        cached = self._appear.get(tid)
+        if cached is not None and (self._frame - 1) - cached[0] < self.verify_every:
+            return cached[1]
+        h, w = self._bgr.shape[:2]
+        x1, y1, x2, y2 = (int(round(v)) for v in xyxy)
+        x1 = max(0, min(x1, w - 1)); x2 = max(x1 + 1, min(x2, w))
+        y1 = max(0, min(y1, h - 1)); y2 = max(y1 + 1, min(y2, h))
+        verdict, _ = self.verifier.verify(self._bgr[y1:y2, x1:x2])
+        verdict = verdict if verdict in ("person", "structure") else None
+        self._appear[tid] = ((self._frame - 1), verdict)
+        return verdict
+
     # ---- the gate ----------------------------------------------------------------------
     def keep(self, xyxy, track_id=None, conf=None):
         """True = keep, False = gate out as a static false positive. Call after update().
@@ -197,7 +222,15 @@ class StaticDetectionFilter:
                 return True
             pinned = (self._frame - 1) - first >= self.confirm_frames
             if pinned or self._in_zone(xyxy):             # candidate static...
-                if self._is_false_positive(tid, xyxy):    # ...but only drop with FP evidence
+                app = self._appearance(tid, xyxy)         # pattern-based check (if a verifier is set)
+                if app == "person":
+                    return True                           # looks like a person -> keep (even a
+                                                          # worker stationary since camera start)
+                if app == "structure":
+                    self._mark_zone(xyxy)
+                    return False                          # confirmed a structure -> drop (even if
+                                                          # YOLO was confident)
+                if self._is_false_positive(tid, xyxy):    # no verifier / unsure -> conf+liveness
                     self._mark_zone(xyxy)
                     return False
             return True                                   # doubt / valid static -> keep
@@ -271,6 +304,45 @@ def selftest():
     return ok
 
 
+class _MockVerifier:
+    """Stand-in for CLIP in the integration self-test: bright crop -> person, mid-grey -> structure."""
+    def verify(self, crop_bgr):
+        m = float(crop_bgr.mean())
+        if m > 185: return "person", 0.5
+        if m < 150: return "structure", 0.5
+        return "unsure", 0.0
+
+
+def selftest_appearance():
+    """The cold-start case: a worker STATIONARY SINCE FRAME 0 (never moved, low confidence,
+    pixel-frozen) must be KEPT once the appearance verifier says 'person' -- while a structure
+    in the same situation is dropped. Without the verifier the person would be suppressed, so
+    this isolates the pattern-based stage."""
+    H, W = 240, 360
+    PERSON = (40, 60, 95, 170); STRUCT = (240, 60, 300, 170)   # both static from the first frame
+    f = StaticDetectionFilter(confirm_frames=12, warmup=10, history=50,
+                              verifier=_MockVerifier(), verify_every=5)
+    rng = np.random.default_rng(2)
+    bg = rng.integers(0, 60, (H, W, 3), dtype=np.uint8)
+    kp, ks = [], []
+    for i in range(70):
+        frame = bg.copy()
+        cv2.rectangle(frame, PERSON[:2], PERSON[2:], (210, 210, 210), -1)   # bright -> "person"
+        cv2.rectangle(frame, STRUCT[:2], STRUCT[2:], (120, 120, 120), -1)   # mid   -> "structure"
+        f.update(frame)
+        p = f.keep(PERSON, 1, conf=0.30)      # low conf, never moves, frozen
+        s = f.keep(STRUCT, 2, conf=0.30)
+        if i > 30:
+            kp.append(p); ks.append(s)
+    pr, sr = float(np.mean(kp)), float(np.mean(ks))
+    print(f"[appearance] cold-start PERSON kept  = {pr:.2f}  (want ~1.00 KEEP via 'person')")
+    print(f"[appearance] STRUCTURE kept          = {sr:.2f}  (want ~0.00 drop via 'structure')")
+    ok = pr > 0.9 and sr < 0.1
+    print("[appearance]", "PASS" if ok else "FAIL",
+          "- appearance keeps a worker stationary since camera start; drops the structure")
+    return ok
+
+
 def selftest_vibration():
     """The gate must ACKNOWLEDGE whole-picture vibration: when the frame jitters, flag
     `vibrating` and suppress nothing (a shaking static box must not be gated as static)."""
@@ -300,5 +372,6 @@ def selftest_vibration():
 if __name__ == "__main__":
     import sys
     a = selftest()
+    c = selftest_appearance()
     b = selftest_vibration()
-    sys.exit(0 if (a and b) else 1)
+    sys.exit(0 if (a and b and c) else 1)
