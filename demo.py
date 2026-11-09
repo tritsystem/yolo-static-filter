@@ -14,7 +14,7 @@ from static_detection_filter import StaticDetectionFilter
 VIDEO = "vtest.avi"
 MODEL = "yolo11n.pt"
 MAXFRAMES = 300
-STATIC_FP = (30, 30, 110, 180)      # fixed "false positive" box on the static background
+STATIC_FP = (20, 15, 95, 80)        # fixed low-confidence "false positive" on static background
 FP_ID = 9999
 
 def main():
@@ -40,7 +40,7 @@ def main():
             real_kept += int(keep.sum())
 
         # injected static false positive (never moves)
-        k_fp = filt.keep(STATIC_FP, track_id=FP_ID)
+        k_fp = filt.keep(STATIC_FP, track_id=FP_ID, conf=0.30)   # low-conf frozen -> real FP
         x1, y1, x2, y2 = STATIC_FP
         col = (0, 200, 0) if k_fp else (0, 0, 200)
         cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)

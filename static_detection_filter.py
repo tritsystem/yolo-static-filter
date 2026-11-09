@@ -39,7 +39,8 @@ class StaticDetectionFilter:
     def __init__(self, confirm_frames=12, warmup=10, static_patience=60,
                  move_eps_px=10.0, move_eps_frac=0.25, zone_hits=8, zone_cover=0.6,
                  motion_thresh=0.02, history=500, var_threshold=16, global_motion_cap=0.5,
-                 vib_shift_px=1.5, vib_response=0.15):
+                 vib_shift_px=1.5, vib_response=0.15,
+                 conf_keep=0.55, live_thresh=3.0, live_window=16):
         """
         confirm_frames   frames a track may stay pinned before it is judged static/suppressed
         warmup           frames to observe before the gate starts suppressing
@@ -63,6 +64,12 @@ class StaticDetectionFilter:
         self.global_motion_cap = float(global_motion_cap)
         self.vib_shift_px = float(vib_shift_px)
         self.vib_response = float(vib_response)
+        # positive false-positive evidence required before suppressing (fixes "removes valid
+        # static objects"): only drop a pinned detection that is BOTH low-confidence AND
+        # pixel-frozen. A confidently-detected or micro-moving (living) object is kept.
+        self.conf_keep = float(conf_keep)        # max conf at/above which a pinned det is kept
+        self.live_thresh = float(live_thresh)    # temporal per-pixel std above which = "alive"
+        self.live_window = int(live_window)
         self._bg = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=var_threshold, detectShadows=False)
         self._frame = 0
@@ -75,6 +82,9 @@ class StaticDetectionFilter:
         self._prev_gray = None              # vibration detector: previous grayscale frame
         self._shift = 0.0                   # last global frame-to-frame shift magnitude (px)
         self.vibrating = False              # True when the whole picture is shaking
+        self._gray = None                   # current grayscale frame (for liveness crops)
+        self._maxconf = {}                  # id -> max detection confidence ever seen
+        self._live = {}                     # id -> recent downscaled gray crops (liveness)
 
     # ---- per-frame update (call once, before keep/gate) --------------------------------
     def update(self, frame_bgr, learning_rate=-1):
@@ -103,6 +113,7 @@ class StaticDetectionFilter:
         if not self.vibrating:
             self._last_motion[fg] = self._frame     # don't trust motion while shaking
         self._fg = fg
+        self._gray = gray
         self._frame += 1
         return mask
 
@@ -127,14 +138,44 @@ class StaticDetectionFilter:
         sub = self._zone[cy1:cy2, cx1:cx2]
         return float((sub >= self.zone_hits).mean()) >= self.zone_cover
 
+    def _alive(self, tid, xyxy):
+        """A living subject is never pixel-frozen (micro-motion, sway, lighting); a rigid
+        structure under a fixed camera is. Track temporal per-pixel std of a small gray crop;
+        'alive' once it rises above live_thresh. Too little history -> assume alive (keep)."""
+        if self._gray is None:
+            return True
+        h, w = self._gray.shape
+        x1, y1, x2, y2 = (int(round(v)) for v in xyxy)
+        x1 = max(0, min(x1, w - 2)); x2 = max(x1 + 1, min(x2, w))
+        y1 = max(0, min(y1, h - 2)); y2 = max(y1 + 1, min(y2, h))
+        crop = cv2.resize(self._gray[y1:y2, x1:x2], (12, 12)).astype(np.float32)
+        buf = self._live.setdefault(tid, [])
+        buf.append(crop)
+        if len(buf) > self.live_window:
+            del buf[0]
+        if len(buf) < 6:
+            return True                                   # not enough history -> keep
+        return float(np.stack(buf).std(axis=0).mean()) > self.live_thresh
+
+    def _is_false_positive(self, tid, xyxy):
+        """Positive evidence this pinned detection is a false positive, not a valid static
+        object: it must be BOTH low-confidence AND pixel-frozen. Any doubt -> not an FP (keep)."""
+        low_conf = self._maxconf.get(tid, 0.0) < self.conf_keep
+        frozen = not self._alive(tid, xyxy)
+        return low_conf and frozen
+
     # ---- the gate ----------------------------------------------------------------------
-    def keep(self, xyxy, track_id=None):
-        """True = keep, False = gate out as a static false positive. Call after update()."""
+    def keep(self, xyxy, track_id=None, conf=None):
+        """True = keep, False = gate out as a static false positive. Call after update().
+        conf = this detection's confidence (0-1); lets the gate keep confidently-detected
+        valid static objects instead of removing them."""
         if self.vibrating:
             return True        # whole picture shaking -> acknowledge, suppress nothing, freeze state
 
         if track_id is not None:
             tid = int(track_id)
+            if conf is not None:
+                self._maxconf[tid] = max(self._maxconf.get(tid, 0.0), float(conf))
             x1, y1, x2, y2 = xyxy
             cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
             diag = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
@@ -142,8 +183,9 @@ class StaticDetectionFilter:
             rec = self._track.get(tid)
             if rec is None:
                 self._track[tid] = [cx, cy, self._frame - 1]
-                # rule 3: new detection dropped into a known static zone, not moving -> gate
-                if (self._frame - 1) > self.warmup and self._in_zone(xyxy):
+                # rule 3: new det in a known static zone, not moving, AND proven FP -> gate
+                if (self._frame - 1) > self.warmup and self._in_zone(xyxy) \
+                        and self._is_false_positive(tid, xyxy):
                     return False
                 return True
             ox, oy, first = rec
@@ -153,13 +195,12 @@ class StaticDetectionFilter:
                 return True                               # rule 1: ever moved -> keep
             if (self._frame - 1) <= self.warmup:
                 return True
-            life = (self._frame - 1) - first
-            if life >= self.confirm_frames:               # rule 2: pinned -> static
-                self._mark_zone(xyxy)
-                return False
-            if self._in_zone(xyxy):                       # rule 3: inside a learned zone
-                return False
-            return True                                   # rule 4: provisional keep
+            pinned = (self._frame - 1) - first >= self.confirm_frames
+            if pinned or self._in_zone(xyxy):             # candidate static...
+                if self._is_false_positive(tid, xyxy):    # ...but only drop with FP evidence
+                    self._mark_zone(xyxy)
+                    return False
+            return True                                   # doubt / valid static -> keep
 
         # no track id: spatial foreground fallback
         if self._fg is None or self._frame <= self.warmup:
@@ -183,37 +224,50 @@ class StaticDetectionFilter:
             return np.zeros(0, dtype=bool), 0
         xyxy = boxes.xyxy.cpu().numpy()
         ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else [None] * len(xyxy)
-        keep = np.array([self.keep(b, t) for b, t in zip(xyxy, ids)], dtype=bool)
+        cfs = boxes.conf.cpu().numpy() if boxes.conf is not None else [None] * len(xyxy)
+        keep = np.array([self.keep(b, t, c) for b, t, c in zip(xyxy, ids, cfs)], dtype=bool)
         return keep, int((~keep).sum())
 
 
 # ----------------------------------------------------------------------------------------
 def selftest():
-    """Planted-case validation: a STATIC box (false positive) next to a MOVING blob (real
-    worker). The gate must suppress the static box and keep the moving one."""
-    H, W = 240, 320
-    STATIC_BOX = (40, 40, 90, 90)
+    """Planted-case validation including the valid-static FIX. Four objects, all static or
+    moving, each with a confidence:
+      FP         low-conf, pixel-frozen static  -> must be SUPPRESSED (a real false positive)
+      VALID_HI   high-conf, pixel-frozen static -> must be KEPT (confidence = real object)
+      VALID_LIVE low-conf, micro-moving static  -> must be KEPT (liveness = real object)
+      MOVER      moving                          -> must be KEPT
+    Only positive FP evidence (low-conf AND frozen) may drop a detection."""
+    H, W = 240, 360
+    FP = (30, 30, 80, 90); VHI = (140, 30, 190, 90); VLIVE = (260, 30, 310, 90)
     f = StaticDetectionFilter(confirm_frames=12, warmup=10, history=50)
     rng = np.random.default_rng(1)
-    bg = rng.integers(0, 60, (H, W, 3), dtype=np.uint8)   # fixed static texture (like a real scene)
-    ks, km = [], []
-    N = 120
+    bg = rng.integers(0, 60, (H, W, 3), dtype=np.uint8)    # fixed static texture
+    k = {"FP": [], "VHI": [], "VLIVE": [], "MOVER": []}
+    N = 130
     for i in range(N):
         frame = bg.copy()
-        cv2.rectangle(frame, STATIC_BOX[:2], STATIC_BOX[2:], (255, 255, 255), -1)
-        cx = 30 + int((W - 60) * (i / N)); cy = 170
+        cv2.rectangle(frame, FP[:2], FP[2:], (230, 230, 230), -1)       # frozen
+        cv2.rectangle(frame, VHI[:2], VHI[2:], (210, 210, 210), -1)     # frozen
+        live = bg[VLIVE[1]:VLIVE[3], VLIVE[0]:VLIVE[2]].astype(np.int16)
+        live = np.clip(live + rng.integers(-18, 19, live.shape), 0, 255).astype(np.uint8)
+        frame[VLIVE[1]:VLIVE[3], VLIVE[0]:VLIVE[2]] = live              # micro-moving
+        cx = 30 + int((W - 60) * (i / N)); cy = 180
         cv2.circle(frame, (cx, cy), 18, (255, 255, 255), -1)
-        moving_box = (cx - 20, cy - 20, cx + 20, cy + 20)
+        mover = (cx - 20, cy - 20, cx + 20, cy + 20)
         f.update(frame)
-        s = f.keep(STATIC_BOX, track_id=1)
-        m = f.keep(moving_box, track_id=2)
-        if i > 30:
-            ks.append(s); km.append(m)
-    sr, mr = float(np.mean(ks)), float(np.mean(km))
-    print(f"[selftest] static false-box kept rate = {sr:.2f}  (want ~0.00)")
-    print(f"[selftest] moving worker  kept rate = {mr:.2f}  (want ~1.00)")
-    ok = sr < 0.1 and mr > 0.9
-    print("[selftest]", "PASS" if ok else "FAIL")
+        r = {"FP": f.keep(FP, 1, conf=0.30), "VHI": f.keep(VHI, 2, conf=0.85),
+             "VLIVE": f.keep(VLIVE, 3, conf=0.35), "MOVER": f.keep(mover, 4, conf=0.80)}
+        if i > 35:
+            for key in k: k[key].append(r[key])
+    rate = {key: float(np.mean(v)) for key, v in k.items()}
+    print(f"[selftest] FP (low-conf frozen) kept   = {rate['FP']:.2f}  (want ~0.00 suppress)")
+    print(f"[selftest] VALID_HI   (high-conf) kept = {rate['VHI']:.2f}  (want ~1.00 KEEP)")
+    print(f"[selftest] VALID_LIVE (micro-move) kept= {rate['VLIVE']:.2f}  (want ~1.00 KEEP)")
+    print(f"[selftest] MOVER kept                  = {rate['MOVER']:.2f}  (want ~1.00 KEEP)")
+    ok = rate["FP"] < 0.15 and rate["VHI"] > 0.9 and rate["VLIVE"] > 0.9 and rate["MOVER"] > 0.9
+    print("[selftest]", "PASS" if ok else "FAIL",
+          "- suppresses only the real FP; keeps valid static objects (confidence/liveness)")
     return ok
 
 
